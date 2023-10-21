@@ -1,9 +1,19 @@
 #include "remotedesktop.h"
 
+#include <stdint.h>
 #include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <xkbcommon/xkbcommon.h>
+#include <linux/input-event-codes.h>
 
 #include "wlr_virtual_pointer.h"
+#include "virtual_keyboard.h"
 #include "xdpw.h"
+
+#include "keymap.h"
 
 static const char object_path[] = "/org/freedesktop/portal/desktop";
 static const char interface_name[] = "org.freedesktop.impl.portal.RemoteDesktop";
@@ -166,6 +176,66 @@ static int method_remotedesktop_select_devices(sd_bus_message *msg, void *data,
 	return 0;
 }
 
+int init_keymap() {
+	char template[] = "/xdpw-keymap-XXXXXX";
+	char const *path;
+	char *name;
+
+	path = getenv("XDG_RUNTIME_DIR");
+	if (!path) {
+		logprint(ERROR, "remotedestop: init_keymap: failed to get XDG_RUNTIME_DIR");
+		errno = ENOENT;
+		return -1;
+	}
+
+	name = malloc(strlen(path) + sizeof(template) + 1);
+	if (!name) {
+		logprint(ERROR, "remotedestop: init_keymap: failed to allocate keymap path");
+		return -1;
+	}
+
+	strcpy(name, path);
+	strcat(name, template);
+
+	int keymap_fd = mkstemp(name);
+	if (keymap_fd == -1) {
+		logprint(ERROR, "remotedesktop: init_keymap: failed to create temporary keymap file");
+		logprint(ERROR, name);
+		logprint(ERROR, strerror(errno));
+		return -1;
+	}
+
+	int flags = fcntl(keymap_fd, F_GETFD);
+	if (flags == -1) {
+		logprint(ERROR, "remotedesktop: init_keymap: failed to query temporary keymap file flags");
+		close(keymap_fd);
+		return -1;
+	}
+
+	if (fcntl(keymap_fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+		logprint(ERROR, "remotedesktop: init_keymap: failed to set temporary keymap file flags");
+		close(keymap_fd);
+		return -1;
+	}
+	unlink(name);
+	free(name);
+
+	off_t keymap_size = strlen(keymap)+64;
+	if (posix_fallocate(keymap_fd, 0, keymap_size)) {
+		logprint(ERROR, "remotedestop: init_keymap: failed to allocate keymap memory");
+		return -1;
+	}
+
+	void *keymap_memory_ptr = mmap(NULL, keymap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		keymap_fd, 0);
+	if (keymap_memory_ptr == (void*)-1) {
+		logprint(ERROR, "remotedesktop: init_keymap: failed to mmap keymap data");
+		return -1;
+	}
+	strcpy(keymap_memory_ptr, keymap);
+	return keymap_fd;
+}
+
 static int method_remotedesktop_start(sd_bus_message *msg, void *data, sd_bus_error *ret_error) {
 	struct xdpw_state *state = data;
 
@@ -194,7 +264,18 @@ static int method_remotedesktop_start(sd_bus_message *msg, void *data, sd_bus_er
 
 	remote = &sess->remotedesktop_data;
 	remote->virtual_pointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(
-		state->remotedesktop.virtual_pointer_manager, NULL);
+		state->remotedesktop.virtual_pointer_manager, state->remotedesktop.seat);
+
+	int keymap_fd = init_keymap();
+	if (keymap_fd > 0)
+	{
+		int keymap_size = strlen(keymap)+64;
+		remote->virtual_keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+			state->remotedesktop.virtual_keyboard_manager, state->remotedesktop.seat);
+		zwp_virtual_keyboard_v1_keymap(remote->virtual_keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+			keymap_fd, keymap_size);
+	}
+
 	clock_gettime(CLOCK_REALTIME, &remote->t_start);
 
 	ret = sd_bus_message_read(msg, "s", &parent_window);
@@ -520,11 +601,134 @@ static int method_remotedesktop_notify_pointer_axis_discrete(
 
 static int method_remotedesktop_notify_keyboard_keycode(
 		sd_bus_message *msg, void *data, sd_bus_error *ret_error) {
+	struct xdpw_state *state = data;
+
+	int ret = 0;
+	char *session_handle;
+	struct xdpw_session *sess;
+	struct xdpw_remotedesktop_session_data *remote;
+	int32_t keycode;
+	uint32_t key_state;
+
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keycode: method invoked");
+
+	ret = sd_bus_message_read(msg, "o", &session_handle);
+	if (ret < 0) {
+		return ret;
+	}
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keycode: session_handle: %s", session_handle);
+
+	wl_list_for_each_reverse(sess, &state->xdpw_sessions, link) {
+		if (strcmp(sess->session_handle, session_handle) == 0) {
+			break;
+		}
+	}
+	if (!sess) {
+		logprint(WARN, "remotedesktop: notify_keyboard_keycode: session not found");
+		return -1;
+	}
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keycode: session found");
+
+	remote = &sess->remotedesktop_data;
+
+	ret = sd_bus_message_skip(msg, "a{sv}");
+	if (ret < 0) {
+		return ret;
+	}
+	ret = sd_bus_message_read(msg, "i", &keycode);
+	if (ret < 0) {
+		return ret;
+	}
+	ret = sd_bus_message_read(msg, "u", &key_state);
+	if (ret < 0) {
+		return ret;
+	}
+
+	// this is not the right way, but at least this enables minimal usage
+	// TODO: Map evdev keycodes to xkb_symbols properly
+	uint32_t key = 0;
+	switch(keycode)
+	{
+		case KEY_BACKSPACE: {
+			key = XKB_KEY_BackSpace - 0xff00;
+			break;
+		}
+		case KEY_ENTER: {
+			key = XKB_KEY_Return - 0xff00;
+			break;
+		}
+		default:
+			return -1;
+	}
+
+	zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
+		get_timestamp_ms(remote),
+		key-7, key_state);
 	return 0;
 }
 
 static int method_remotedesktop_notify_keyboard_keysym(
 		sd_bus_message *msg, void *data, sd_bus_error *ret_error) {
+	struct xdpw_state *state = data;
+
+	int ret = 0;
+	char *session_handle;
+	struct xdpw_session *sess;
+	struct xdpw_remotedesktop_session_data *remote;
+	int32_t keysym;
+	uint32_t key_state;
+
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keysym: method invoked");
+
+	ret = sd_bus_message_read(msg, "o", &session_handle);
+	if (ret < 0) {
+		return ret;
+	}
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keysym: session_handle: %s", session_handle);
+
+	wl_list_for_each_reverse(sess, &state->xdpw_sessions, link) {
+		if (strcmp(sess->session_handle, session_handle) == 0) {
+			break;
+		}
+	}
+	if (!sess) {
+		logprint(WARN, "remotedesktop: notify_keyboard_keysym: session not found");
+		return -1;
+	}
+	logprint(DEBUG, "remotedesktop: notify_keyboard_keysym: session found");
+
+	remote = &sess->remotedesktop_data;
+
+	ret = sd_bus_message_skip(msg, "a{sv}");
+	if (ret < 0) {
+		return ret;
+	}
+	ret = sd_bus_message_read(msg, "i", &keysym);
+	if (ret < 0) {
+		return ret;
+	}
+	ret = sd_bus_message_read(msg, "u", &key_state);
+	if (ret < 0) {
+		return ret;
+	}
+
+	// map char to xkb_keycode_t
+	uint32_t keycode = keysym;
+	if(keycode < 0x20) {
+		keycode += 0xff00;
+	}
+	else if(keycode > 127) {
+		// FIXME: create more temporary keymaps and switch between them if needed
+		logprint(WARN, "remotedestop: notify_keyboard_keysym: keysym > 127 not supported for now");
+		return -1;
+	}
+	else {
+		keycode -= 7;
+	}
+
+	zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
+		get_timestamp_ms(remote),
+		keycode, key_state);
 	return 0;
 }
 
@@ -592,8 +796,16 @@ int xdpw_remotedesktop_init(struct xdpw_state *state) {
 		goto fail_virtual_pointer;
 	}
 
+	err = xdpw_virtual_keyboard_init(state);
+	if (err) {
+		goto fail_virtual_keyboard;
+	}
+
 	return sd_bus_add_object_vtable(state->bus, &slot, object_path,
 		interface_name, remotedesktop_vtable, state);
+
+fail_virtual_keyboard:
+	xdpw_virtual_keyboard_finish(&state->remotedesktop);
 
 fail_virtual_pointer:
 	xdpw_wlr_virtual_pointer_finish(&state->remotedesktop);
