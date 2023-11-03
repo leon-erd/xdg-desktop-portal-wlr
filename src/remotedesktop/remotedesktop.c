@@ -557,10 +557,10 @@ static int method_remotedesktop_notify_pointer_axis(sd_bus_message *msg,
 
 	zwlr_virtual_pointer_v1_axis(sess->remotedesktop_data.virtual_pointer,
 		get_timestamp_ms(&sess->remotedesktop_data),
-		WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(dy * 10));
+		WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(dy));
 	zwlr_virtual_pointer_v1_axis(sess->remotedesktop_data.virtual_pointer,
 		get_timestamp_ms(&sess->remotedesktop_data),
-		WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(dx * 10));
+		WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(dx));
 
 	if (finish) {
 		zwlr_virtual_pointer_v1_axis_stop(sess->remotedesktop_data.virtual_pointer,
