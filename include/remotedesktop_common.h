@@ -29,6 +29,9 @@ struct xdpw_remotedesktop_session_data {
 	struct zwp_virtual_keyboard_v1 *virtual_keyboard;
 	struct zwlr_virtual_pointer_v1 *virtual_pointer;
 	struct timespec t_start;
+
+	struct xdpw_timer *motion_timer;
+	struct xdpw_timer *axis_timer;
 };
 
 enum device_types {

@@ -17,6 +17,7 @@
 
 static const char object_path[] = "/org/freedesktop/portal/desktop";
 static const char interface_name[] = "org.freedesktop.impl.portal.RemoteDesktop";
+static const uint32_t delay_frame_end_ns = 5000;
 
 static uint32_t get_timestamp_ms(struct xdpw_remotedesktop_session_data *remote) {
 	struct timespec *t_start, t_stop;
@@ -236,6 +237,20 @@ int init_keymap() {
 	return keymap_fd;
 }
 
+void remote_desktop_send_frame_motion(void *data) {
+	struct xdpw_session *sess = data;
+
+	zwlr_virtual_pointer_v1_frame(sess->remotedesktop_data.virtual_pointer);
+	sess->remotedesktop_data.motion_timer = NULL;
+}
+
+void remote_desktop_send_frame_axis(void *data) {
+	struct xdpw_session *sess = data;
+
+	zwlr_virtual_pointer_v1_frame(sess->remotedesktop_data.virtual_pointer);
+	sess->remotedesktop_data.axis_timer = NULL;
+}
+
 static int method_remotedesktop_start(sd_bus_message *msg, void *data, sd_bus_error *ret_error) {
 	struct xdpw_state *state = data;
 
@@ -364,6 +379,12 @@ static int method_remotedesktop_notify_pointer_motion(sd_bus_message *msg,
 		get_timestamp_ms(&sess->remotedesktop_data),
 		wl_fixed_from_double(dx), wl_fixed_from_double(dy));
 
+	if(sess->remotedesktop_data.motion_timer != NULL) {
+		xdpw_destroy_timer(sess->remotedesktop_data.motion_timer);
+	}
+	sess->remotedesktop_data.motion_timer = xdpw_add_timer(state, delay_frame_end_ns,
+		(xdpw_event_loop_timer_func_t) remote_desktop_send_frame_motion, sess);
+
 	return 0;
 }
 
@@ -462,6 +483,7 @@ static int method_remotedesktop_notify_pointer_button(sd_bus_message *msg,
 	zwlr_virtual_pointer_v1_button(sess->remotedesktop_data.virtual_pointer,
 		get_timestamp_ms(&sess->remotedesktop_data),
 		button, btn_state);
+	zwlr_virtual_pointer_v1_frame(sess->remotedesktop_data.virtual_pointer);
 	return 0;
 }
 
@@ -548,6 +570,13 @@ static int method_remotedesktop_notify_pointer_axis(sd_bus_message *msg,
 			get_timestamp_ms(&sess->remotedesktop_data),
 			WL_POINTER_AXIS_HORIZONTAL_SCROLL);
 	}
+
+	if(sess->remotedesktop_data.axis_timer != NULL) {
+		xdpw_destroy_timer(sess->remotedesktop_data.axis_timer);
+	}
+	sess->remotedesktop_data.axis_timer = xdpw_add_timer(state, delay_frame_end_ns,
+		(xdpw_event_loop_timer_func_t) remote_desktop_send_frame_axis, sess);
+
 	return 0;
 }
 
