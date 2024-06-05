@@ -1,3 +1,5 @@
+#include <xkbcommon/xkbcommon.h>
+
 #include "virtual_keyboard.h"
 
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
@@ -35,6 +37,10 @@ static const struct wl_registry_listener wlr_registry_listener = {
 	.global_remove = NULL,
 };
 
+struct xkb_context *xkb_ctx;
+struct xkb_keymap *xkb_keymap;
+struct xkb_state* xkb_state;
+
 int xdpw_virtual_keyboard_init(struct xdpw_state *state) {
 	struct xdpw_remotedesktop_context *ctx = &state->remotedesktop;
 
@@ -53,6 +59,23 @@ int xdpw_virtual_keyboard_init(struct xdpw_state *state) {
 			zwp_virtual_keyboard_manager_v1_interface.name);
 		return -1;
 	}
+
+	struct xkb_rule_names names = {
+        .rules = "",
+        .model = "",
+        .layout = "us",
+        .variant = "",
+        .options = ""
+    };
+
+	xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	xkb_keymap = xkb_keymap_new_from_names(
+		xkb_ctx,
+		&names,
+		XKB_KEYMAP_COMPILE_NO_FLAGS
+	);
+
+	xkb_state = xkb_state_new(xkb_keymap);
 
 	return 0;
 }

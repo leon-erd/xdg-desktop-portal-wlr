@@ -13,7 +13,7 @@
 #include "virtual_keyboard.h"
 #include "xdpw.h"
 
-#include "keymap.h"
+#include <xkbcommon/xkbcommon.h>
 
 static const char object_path[] = "/org/freedesktop/portal/desktop";
 static const char interface_name[] = "org.freedesktop.impl.portal.RemoteDesktop";
@@ -28,6 +28,10 @@ static uint32_t get_timestamp_ms(struct xdpw_remotedesktop_session_data *remote)
 	return 1000 * (t_stop.tv_sec - t_start->tv_sec) +
 		(t_stop.tv_nsec - t_start->tv_nsec) / 1000000;
 }
+
+struct keymap_container {
+	int fd, size;
+};
 
 static struct xdpw_session *get_session_from_handle(struct xdpw_state *state, char *session_handle) {
 	struct xdpw_session *sess;
@@ -177,8 +181,9 @@ static int method_remotedesktop_select_devices(sd_bus_message *msg, void *data,
 	return 0;
 }
 
-int init_keymap() {
+struct keymap_container init_keymap() {
 	char template[] = "/xdpw-keymap-XXXXXX";
+	struct keymap_container ret;
 	char const *path;
 	char *name;
 
@@ -186,13 +191,15 @@ int init_keymap() {
 	if (!path) {
 		logprint(ERROR, "remotedestop: init_keymap: failed to get XDG_RUNTIME_DIR");
 		errno = ENOENT;
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 
 	name = malloc(strlen(path) + sizeof(template) + 1);
 	if (!name) {
 		logprint(ERROR, "remotedestop: init_keymap: failed to allocate keymap path");
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 
 	strcpy(name, path);
@@ -203,38 +210,50 @@ int init_keymap() {
 		logprint(ERROR, "remotedesktop: init_keymap: failed to create temporary keymap file");
 		logprint(ERROR, name);
 		logprint(ERROR, strerror(errno));
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 
 	int flags = fcntl(keymap_fd, F_GETFD);
 	if (flags == -1) {
 		logprint(ERROR, "remotedesktop: init_keymap: failed to query temporary keymap file flags");
 		close(keymap_fd);
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 
 	if (fcntl(keymap_fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
 		logprint(ERROR, "remotedesktop: init_keymap: failed to set temporary keymap file flags");
 		close(keymap_fd);
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 	unlink(name);
 	free(name);
 
-	off_t keymap_size = strlen(keymap)+64;
+	char *keymap_str = xkb_keymap_get_as_string(xkb_state_get_keymap(xkb_state), XKB_KEYMAP_FORMAT_TEXT_V1);
+
+	off_t keymap_size = strlen(keymap_str);
 	if (posix_fallocate(keymap_fd, 0, keymap_size)) {
 		logprint(ERROR, "remotedestop: init_keymap: failed to allocate keymap memory");
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
 
 	void *keymap_memory_ptr = mmap(NULL, keymap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		keymap_fd, 0);
 	if (keymap_memory_ptr == (void*)-1) {
 		logprint(ERROR, "remotedesktop: init_keymap: failed to mmap keymap data");
-		return -1;
+		ret.fd = -1;
+		return ret;
 	}
-	strcpy(keymap_memory_ptr, keymap);
-	return keymap_fd;
+
+	// TODO Idk if this is needed
+	ftruncate(keymap_fd, keymap_size);
+	strcpy(keymap_memory_ptr, keymap_str);
+	ret.fd = keymap_fd;
+	ret.size = keymap_size;
+	return ret;
 }
 
 void remote_desktop_send_frame_motion(void *data) {
@@ -281,14 +300,13 @@ static int method_remotedesktop_start(sd_bus_message *msg, void *data, sd_bus_er
 	remote->virtual_pointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(
 		state->remotedesktop.virtual_pointer_manager, state->remotedesktop.seat);
 
-	int keymap_fd = init_keymap();
-	if (keymap_fd > 0)
+	struct keymap_container keymap_container = init_keymap();
+	if (keymap_container.fd > 0)
 	{
-		int keymap_size = strlen(keymap)+64;
 		remote->virtual_keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
 			state->remotedesktop.virtual_keyboard_manager, state->remotedesktop.seat);
 		zwp_virtual_keyboard_v1_keymap(remote->virtual_keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
-			keymap_fd, keymap_size);
+			keymap_container.fd, keymap_container.size);
 	}
 
 	clock_gettime(CLOCK_REALTIME, &remote->t_start);
@@ -673,27 +691,40 @@ static int method_remotedesktop_notify_keyboard_keycode(
 		return ret;
 	}
 
-	// this is not the right way, but at least this enables minimal usage
-	// TODO: Map evdev keycodes to xkb_symbols properly
-	uint32_t key = 0;
-	switch(keycode)
-	{
-		case KEY_BACKSPACE: {
-			key = XKB_KEY_BackSpace - 0xff00;
-			break;
-		}
-		case KEY_ENTER: {
-			key = XKB_KEY_Return - 0xff00;
-			break;
-		}
-		default:
-			return -1;
-	}
-
 	zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
 		get_timestamp_ms(remote),
-		key-7, key_state);
+		keycode, key_state);
 	return 0;
+}
+
+struct keycode_container {
+	uint32_t level, code;
+};
+
+static struct keycode_container keycode_from_keysym(xkb_keysym_t keysym) {
+	static const int EVDEV_OFFSET = 8;
+	struct keycode_container ret;
+	ret.code = -1;
+	ret.level = -1;
+
+	uint32_t layout = xkb_state_serialize_layout(xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+	const xkb_keycode_t max = xkb_keymap_max_keycode(xkb_keymap);
+	for (xkb_keycode_t keycode = xkb_keymap_min_keycode(xkb_keymap); keycode < max; keycode++) {
+		uint32_t levelCount = xkb_keymap_num_levels_for_key(xkb_keymap, keycode, layout);
+		for (uint32_t currentLevel = 0; currentLevel < levelCount; currentLevel++) {
+			const xkb_keysym_t *syms;
+			uint32_t num_syms = xkb_keymap_key_get_syms_by_level(xkb_keymap, keycode, layout, currentLevel, &syms);
+			for (uint32_t sym = 0; sym < num_syms; sym++) {
+				if (syms[sym] == keysym) {
+					ret.level = currentLevel;
+					ret.code = keycode - EVDEV_OFFSET;
+					return ret;
+				}
+			}
+		}
+	}
+
+	return ret;
 }
 
 static int method_remotedesktop_notify_keyboard_keysym(
@@ -742,22 +773,26 @@ static int method_remotedesktop_notify_keyboard_keysym(
 	}
 
 	// map char to xkb_keycode_t
-	uint32_t keycode = keysym;
-	if(keycode < 0x20) {
-		keycode += 0xff00;
-	}
-	else if(keycode > 127) {
-		// FIXME: create more temporary keymaps and switch between them if needed
-		logprint(WARN, "remotedestop: notify_keyboard_keysym: keysym > 127 not supported for now");
-		return -1;
-	}
-	else {
-		keycode -= 7;
+	struct keycode_container container = keycode_from_keysym(keysym);
+
+	switch (container.level) {
+		case 0:
+			break;
+		case 1:
+			zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
+			get_timestamp_ms(remote),
+			XKB_KEY_Shift_L, key_state);
+			break;
+		case 2:
+			zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
+			get_timestamp_ms(remote),
+			XKB_KEY_Alt_R, key_state);
+			break;
 	}
 
 	zwp_virtual_keyboard_v1_key(remote->virtual_keyboard,
 		get_timestamp_ms(remote),
-		keycode, key_state);
+		container.code, key_state);
 	return 0;
 }
 

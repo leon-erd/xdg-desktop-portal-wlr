@@ -29,6 +29,7 @@ wayland_protos = dependency('wayland-protocols', version: '>=1.24')
 iniparser = dependency('inih')
 gbm = dependency('gbm')
 drm = dependency('libdrm')
+xkbcommon = dependency('xkbcommon')
 
 epoll = dependency('', required: false)
 if (not cc.has_function('timerfd_create', prefix: '#include <sys/timerfd.h>') or
@@ -94,6 +95,7 @@ executable(
 		gbm,
 		drm,
 		epoll,
+ 		xkbcommon,
 	],
 	include_directories: [inc],
 	install: true,

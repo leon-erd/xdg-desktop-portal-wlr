@@ -6,6 +6,10 @@
 
 #include "remotedesktop_common.h"
 
+extern struct xkb_context *xkb_ctx;
+extern struct xkb_keymap *xkb_keymap;
+extern struct xkb_state* xkb_state;
+
 struct xdpw_state;
 
 int xdpw_virtual_keyboard_init(struct xdpw_state *state);
